@@ -1,0 +1,630 @@
+// ============================================================
+// SWIFT ALGO-STYLE OPTIMIZATION ENGINE — SL/TP Exit Logic
+// Pine Script v5
+// 
+// ENTRY: Supertrend flip (ATR-based trend detection)
+// EXIT:  Stop Loss = Swing High/Low | Take Profit = SL × RR
+//
+// The optimizer scans 96 combinations of:
+//   - ATR Multiplier (6 values)
+//   - ATR Period (4 values)
+//   - Swing Lookback Length (4 values)
+//
+// You set RR manually. The engine finds which combo gives the
+// best win rate using proper SL/TP exits (not opposite signals).
+//
+// Dashboard shows top-3 ranked combos.
+// ============================================================
+
+//@version=5
+indicator("Optimization Engine [Swift Algo — SL/TP]", overlay=true, max_bars_back=500)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+grp_current = "Current Settings"
+i_mult      = input.float(3.0, "ATR Multiplier",       minval=0.5, maxval=8.0, step=0.5, group=grp_current)
+i_per       = input.int  (10,  "ATR Period",            minval=5,   maxval=50,  step=1,   group=grp_current)
+i_swing_len = input.int  (10,  "Swing Lookback Length", minval=3,   maxval=50,  step=1,   group=grp_current,
+     tooltip="Number of candles to look back for swing high/low stop loss")
+
+grp_exit = "Exit Settings"
+i_rr = input.float(2.0, "Risk:Reward Ratio", minval=0.5, maxval=10.0, step=0.5, group=grp_exit,
+     tooltip="Take profit distance = stop loss distance × RR. Example: RR=2.0 means TP is 2x further than SL.")
+
+grp_opt = "Optimization Settings"
+i_lookback  = input.int(100, "Lookback Bars for Backtesting", minval=50, maxval=500, step=10, group=grp_opt,
+     tooltip="Number of historical bars used to evaluate each parameter combo. More = slower but more reliable.")
+i_show_dash = input.bool(true, "Show Dashboard Table", group=grp_opt)
+
+// ─────────────────────────────────────────────
+// PARAMETER GRID  (6 × 4 × 4 = 96 combos)
+// ─────────────────────────────────────────────
+var float[] MULTS      = array.from(1.5, 2.0, 2.5, 3.0, 3.5, 4.0)  // 6
+var int[]   PERIODS    = array.from(7, 10, 14, 20)                 // 4
+var int[]   SWING_LENS = array.from(5, 10, 15, 20)                 // 4
+
+// ─────────────────────────────────────────────
+// PRE-COMPUTE SUPERTREND DIRECTIONS
+// We need all 6×4=24 Supertrend combos (mult × period)
+// Swing lookback is applied during backtest loop, not here
+// ─────────────────────────────────────────────
+[_st_15_07, dir_15_07] = ta.supertrend(1.5, 7)
+[_st_15_10, dir_15_10] = ta.supertrend(1.5, 10)
+[_st_15_14, dir_15_14] = ta.supertrend(1.5, 14)
+[_st_15_20, dir_15_20] = ta.supertrend(1.5, 20)
+
+[_st_20_07, dir_20_07] = ta.supertrend(2.0, 7)
+[_st_20_10, dir_20_10] = ta.supertrend(2.0, 10)
+[_st_20_14, dir_20_14] = ta.supertrend(2.0, 14)
+[_st_20_20, dir_20_20] = ta.supertrend(2.0, 20)
+
+[_st_25_07, dir_25_07] = ta.supertrend(2.5, 7)
+[_st_25_10, dir_25_10] = ta.supertrend(2.5, 10)
+[_st_25_14, dir_25_14] = ta.supertrend(2.5, 14)
+[_st_25_20, dir_25_20] = ta.supertrend(2.5, 20)
+
+[_st_30_07, dir_30_07] = ta.supertrend(3.0, 7)
+[_st_30_10, dir_30_10] = ta.supertrend(3.0, 10)
+[_st_30_14, dir_30_14] = ta.supertrend(3.0, 14)
+[_st_30_20, dir_30_20] = ta.supertrend(3.0, 20)
+
+[_st_35_07, dir_35_07] = ta.supertrend(3.5, 7)
+[_st_35_10, dir_35_10] = ta.supertrend(3.5, 10)
+[_st_35_14, dir_35_14] = ta.supertrend(3.5, 14)
+[_st_35_20, dir_35_20] = ta.supertrend(3.5, 20)
+
+[_st_40_07, dir_40_07] = ta.supertrend(4.0, 7)
+[_st_40_10, dir_40_10] = ta.supertrend(4.0, 10)
+[_st_40_14, dir_40_14] = ta.supertrend(4.0, 14)
+[_st_40_20, dir_40_20] = ta.supertrend(4.0, 20)
+
+// User's current settings
+[_st_user, dir_user] = ta.supertrend(i_mult, i_per)
+
+// ─────────────────────────────────────────────
+// PRE-COMPUTE SWING HIGHS/LOWS
+// We need 4 swing lookback lengths
+// ─────────────────────────────────────────────
+swing_low_05  = ta.lowest(low,  5)
+swing_high_05 = ta.highest(high, 5)
+
+swing_low_10  = ta.lowest(low,  10)
+swing_high_10 = ta.highest(high, 10)
+
+swing_low_15  = ta.lowest(low,  15)
+swing_high_15 = ta.highest(high, 15)
+
+swing_low_20  = ta.lowest(low,  20)
+swing_high_20 = ta.highest(high, 20)
+
+// User's current swing levels
+swing_low_user  = ta.lowest(low,  i_swing_len)
+swing_high_user = ta.highest(high, i_swing_len)
+
+// ─────────────────────────────────────────────
+// BACKTEST ENGINE — SL/TP Exit Logic
+//
+// For a given Supertrend direction series and swing lookback:
+//   1. Walk through bars detecting Supertrend flips
+//   2. On flip: open trade with SL at swing high/low, TP at entry ± (risk × RR)
+//   3. Walk forward checking each bar's high/low vs SL/TP
+//   4. First hit = exit, record win or loss
+//   5. Ignore future signals until trade closes
+//
+// Returns: [win_rate, total_trades]
+// ─────────────────────────────────────────────
+get_winrate(series float dir_series, series float sw_low, series float sw_high, float rr, int lookback) =>
+    int   wins   = 0
+    int   total  = 0
+    
+    // Trade state
+    float trade_dir    = 0.0   // 0=no trade, 1=long, -1=short
+    float entry_price  = 0.0
+    float stop_loss    = 0.0
+    float take_profit  = 0.0
+    
+    int safe_start = math.max(2, math.max(25, bar_index - lookback))  // Ensure we have swing data
+    
+    if bar_index >= safe_start
+        for i = 1 to math.min(lookback, bar_index - safe_start)
+            int offset = i
+            
+            float cur_dir  = dir_series[offset]
+            float prev_dir = dir_series[offset + 1]
+            
+            float bar_open  = open[offset]
+            float bar_high  = high[offset]
+            float bar_low   = low[offset]
+            float bar_close = close[offset]
+            
+            // ── Check if active trade hit SL or TP ───────────────
+            if trade_dir != 0.0
+                bool hit_sl = trade_dir == 1.0 ? (bar_low <= stop_loss)  : (bar_high >= stop_loss)
+                bool hit_tp = trade_dir == 1.0 ? (bar_high >= take_profit) : (bar_low <= take_profit)
+                
+                // Exit trade on first hit
+                if hit_sl or hit_tp
+                    wins  += hit_tp ? 1 : 0
+                    total += 1
+                    trade_dir := 0.0
+            
+            // ── Open new trade on Supertrend flip ────────────────
+            if trade_dir == 0.0  // Only enter if no active trade
+                bool flipped_long  = (prev_dir == 1.0  and cur_dir == -1.0)
+                bool flipped_short = (prev_dir == -1.0 and cur_dir == 1.0)
+                
+                if flipped_long
+                    trade_dir    := 1.0
+                    entry_price  := bar_close
+                    stop_loss    := sw_low[offset]
+                    float risk   = entry_price - stop_loss
+                    take_profit  := entry_price + (risk * rr)
+                    
+                else if flipped_short
+                    trade_dir    := -1.0
+                    entry_price  := bar_close
+                    stop_loss    := sw_high[offset]
+                    float risk   = stop_loss - entry_price
+                    take_profit  := entry_price - (risk * rr)
+    
+    float wr = total > 0 ? (wins / total) * 100.0 : 0.0
+    [wr, total]
+
+// ─────────────────────────────────────────────
+// RUN BACKTEST FOR ALL 96 COMBOS
+// For each (mult, period, swing_len): call get_winrate()
+// ─────────────────────────────────────────────
+
+// Helper: get swing series by length
+get_swing_low(int len) =>
+    switch len
+        5  => swing_low_05
+        10 => swing_low_10
+        15 => swing_low_15
+        20 => swing_low_20
+        => swing_low_10
+
+get_swing_high(int len) =>
+    switch len
+        5  => swing_high_05
+        10 => swing_high_10
+        15 => swing_high_15
+        20 => swing_high_20
+        => swing_high_10
+
+// ── Mult 1.5 ──────────────────────────────────────────────
+[wr_15_07_05, t_15_07_05] = get_winrate(dir_15_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_15_07_10, t_15_07_10] = get_winrate(dir_15_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_15_07_15, t_15_07_15] = get_winrate(dir_15_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_15_07_20, t_15_07_20] = get_winrate(dir_15_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_15_10_05, t_15_10_05] = get_winrate(dir_15_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_15_10_10, t_15_10_10] = get_winrate(dir_15_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_15_10_15, t_15_10_15] = get_winrate(dir_15_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_15_10_20, t_15_10_20] = get_winrate(dir_15_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_15_14_05, t_15_14_05] = get_winrate(dir_15_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_15_14_10, t_15_14_10] = get_winrate(dir_15_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_15_14_15, t_15_14_15] = get_winrate(dir_15_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_15_14_20, t_15_14_20] = get_winrate(dir_15_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_15_20_05, t_15_20_05] = get_winrate(dir_15_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_15_20_10, t_15_20_10] = get_winrate(dir_15_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_15_20_15, t_15_20_15] = get_winrate(dir_15_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_15_20_20, t_15_20_20] = get_winrate(dir_15_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── Mult 2.0 ──────────────────────────────────────────────
+[wr_20_07_05, t_20_07_05] = get_winrate(dir_20_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_20_07_10, t_20_07_10] = get_winrate(dir_20_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_20_07_15, t_20_07_15] = get_winrate(dir_20_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_20_07_20, t_20_07_20] = get_winrate(dir_20_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_20_10_05, t_20_10_05] = get_winrate(dir_20_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_20_10_10, t_20_10_10] = get_winrate(dir_20_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_20_10_15, t_20_10_15] = get_winrate(dir_20_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_20_10_20, t_20_10_20] = get_winrate(dir_20_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_20_14_05, t_20_14_05] = get_winrate(dir_20_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_20_14_10, t_20_14_10] = get_winrate(dir_20_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_20_14_15, t_20_14_15] = get_winrate(dir_20_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_20_14_20, t_20_14_20] = get_winrate(dir_20_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_20_20_05, t_20_20_05] = get_winrate(dir_20_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_20_20_10, t_20_20_10] = get_winrate(dir_20_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_20_20_15, t_20_20_15] = get_winrate(dir_20_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_20_20_20, t_20_20_20] = get_winrate(dir_20_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── Mult 2.5 ──────────────────────────────────────────────
+[wr_25_07_05, t_25_07_05] = get_winrate(dir_25_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_25_07_10, t_25_07_10] = get_winrate(dir_25_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_25_07_15, t_25_07_15] = get_winrate(dir_25_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_25_07_20, t_25_07_20] = get_winrate(dir_25_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_25_10_05, t_25_10_05] = get_winrate(dir_25_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_25_10_10, t_25_10_10] = get_winrate(dir_25_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_25_10_15, t_25_10_15] = get_winrate(dir_25_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_25_10_20, t_25_10_20] = get_winrate(dir_25_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_25_14_05, t_25_14_05] = get_winrate(dir_25_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_25_14_10, t_25_14_10] = get_winrate(dir_25_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_25_14_15, t_25_14_15] = get_winrate(dir_25_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_25_14_20, t_25_14_20] = get_winrate(dir_25_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_25_20_05, t_25_20_05] = get_winrate(dir_25_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_25_20_10, t_25_20_10] = get_winrate(dir_25_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_25_20_15, t_25_20_15] = get_winrate(dir_25_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_25_20_20, t_25_20_20] = get_winrate(dir_25_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── Mult 3.0 ──────────────────────────────────────────────
+[wr_30_07_05, t_30_07_05] = get_winrate(dir_30_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_30_07_10, t_30_07_10] = get_winrate(dir_30_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_30_07_15, t_30_07_15] = get_winrate(dir_30_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_30_07_20, t_30_07_20] = get_winrate(dir_30_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_30_10_05, t_30_10_05] = get_winrate(dir_30_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_30_10_10, t_30_10_10] = get_winrate(dir_30_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_30_10_15, t_30_10_15] = get_winrate(dir_30_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_30_10_20, t_30_10_20] = get_winrate(dir_30_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_30_14_05, t_30_14_05] = get_winrate(dir_30_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_30_14_10, t_30_14_10] = get_winrate(dir_30_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_30_14_15, t_30_14_15] = get_winrate(dir_30_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_30_14_20, t_30_14_20] = get_winrate(dir_30_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_30_20_05, t_30_20_05] = get_winrate(dir_30_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_30_20_10, t_30_20_10] = get_winrate(dir_30_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_30_20_15, t_30_20_15] = get_winrate(dir_30_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_30_20_20, t_30_20_20] = get_winrate(dir_30_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── Mult 3.5 ──────────────────────────────────────────────
+[wr_35_07_05, t_35_07_05] = get_winrate(dir_35_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_35_07_10, t_35_07_10] = get_winrate(dir_35_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_35_07_15, t_35_07_15] = get_winrate(dir_35_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_35_07_20, t_35_07_20] = get_winrate(dir_35_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_35_10_05, t_35_10_05] = get_winrate(dir_35_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_35_10_10, t_35_10_10] = get_winrate(dir_35_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_35_10_15, t_35_10_15] = get_winrate(dir_35_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_35_10_20, t_35_10_20] = get_winrate(dir_35_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_35_14_05, t_35_14_05] = get_winrate(dir_35_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_35_14_10, t_35_14_10] = get_winrate(dir_35_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_35_14_15, t_35_14_15] = get_winrate(dir_35_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_35_14_20, t_35_14_20] = get_winrate(dir_35_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_35_20_05, t_35_20_05] = get_winrate(dir_35_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_35_20_10, t_35_20_10] = get_winrate(dir_35_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_35_20_15, t_35_20_15] = get_winrate(dir_35_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_35_20_20, t_35_20_20] = get_winrate(dir_35_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── Mult 4.0 ──────────────────────────────────────────────
+[wr_40_07_05, t_40_07_05] = get_winrate(dir_40_07, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_40_07_10, t_40_07_10] = get_winrate(dir_40_07, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_40_07_15, t_40_07_15] = get_winrate(dir_40_07, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_40_07_20, t_40_07_20] = get_winrate(dir_40_07, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_40_10_05, t_40_10_05] = get_winrate(dir_40_10, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_40_10_10, t_40_10_10] = get_winrate(dir_40_10, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_40_10_15, t_40_10_15] = get_winrate(dir_40_10, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_40_10_20, t_40_10_20] = get_winrate(dir_40_10, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_40_14_05, t_40_14_05] = get_winrate(dir_40_14, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_40_14_10, t_40_14_10] = get_winrate(dir_40_14, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_40_14_15, t_40_14_15] = get_winrate(dir_40_14, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_40_14_20, t_40_14_20] = get_winrate(dir_40_14, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+[wr_40_20_05, t_40_20_05] = get_winrate(dir_40_20, get_swing_low(5),  get_swing_high(5),  i_rr, i_lookback)
+[wr_40_20_10, t_40_20_10] = get_winrate(dir_40_20, get_swing_low(10), get_swing_high(10), i_rr, i_lookback)
+[wr_40_20_15, t_40_20_15] = get_winrate(dir_40_20, get_swing_low(15), get_swing_high(15), i_rr, i_lookback)
+[wr_40_20_20, t_40_20_20] = get_winrate(dir_40_20, get_swing_low(20), get_swing_high(20), i_rr, i_lookback)
+
+// ── User's current settings ───────────────────────────────
+[wr_user, t_user] = get_winrate(dir_user, swing_low_user, swing_high_user, i_rr, i_lookback)
+
+// ─────────────────────────────────────────────
+// COLLECT ALL 96 RESULTS INTO ARRAYS
+// ─────────────────────────────────────────────
+var float[] all_wr    = array.new_float(0)
+var float[] all_mult  = array.new_float(0)
+var int[]   all_per   = array.new_int(0)
+var int[]   all_swing = array.new_int(0)
+var int[]   all_tot   = array.new_int(0)
+
+if barstate.islast
+    array.clear(all_wr)
+    array.clear(all_mult)
+    array.clear(all_per)
+    array.clear(all_swing)
+    array.clear(all_tot)
+    
+    // Push all 96 combos (mult, period, swing_len)
+    // Mult 1.5
+    array.push(all_wr, wr_15_07_05), array.push(all_mult, 1.5), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_15_07_05)
+    array.push(all_wr, wr_15_07_10), array.push(all_mult, 1.5), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_15_07_10)
+    array.push(all_wr, wr_15_07_15), array.push(all_mult, 1.5), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_15_07_15)
+    array.push(all_wr, wr_15_07_20), array.push(all_mult, 1.5), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_15_07_20)
+    
+    array.push(all_wr, wr_15_10_05), array.push(all_mult, 1.5), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_15_10_05)
+    array.push(all_wr, wr_15_10_10), array.push(all_mult, 1.5), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_15_10_10)
+    array.push(all_wr, wr_15_10_15), array.push(all_mult, 1.5), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_15_10_15)
+    array.push(all_wr, wr_15_10_20), array.push(all_mult, 1.5), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_15_10_20)
+    
+    array.push(all_wr, wr_15_14_05), array.push(all_mult, 1.5), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_15_14_05)
+    array.push(all_wr, wr_15_14_10), array.push(all_mult, 1.5), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_15_14_10)
+    array.push(all_wr, wr_15_14_15), array.push(all_mult, 1.5), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_15_14_15)
+    array.push(all_wr, wr_15_14_20), array.push(all_mult, 1.5), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_15_14_20)
+    
+    array.push(all_wr, wr_15_20_05), array.push(all_mult, 1.5), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_15_20_05)
+    array.push(all_wr, wr_15_20_10), array.push(all_mult, 1.5), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_15_20_10)
+    array.push(all_wr, wr_15_20_15), array.push(all_mult, 1.5), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_15_20_15)
+    array.push(all_wr, wr_15_20_20), array.push(all_mult, 1.5), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_15_20_20)
+    
+    // Mult 2.0
+    array.push(all_wr, wr_20_07_05), array.push(all_mult, 2.0), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_20_07_05)
+    array.push(all_wr, wr_20_07_10), array.push(all_mult, 2.0), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_20_07_10)
+    array.push(all_wr, wr_20_07_15), array.push(all_mult, 2.0), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_20_07_15)
+    array.push(all_wr, wr_20_07_20), array.push(all_mult, 2.0), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_20_07_20)
+    
+    array.push(all_wr, wr_20_10_05), array.push(all_mult, 2.0), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_20_10_05)
+    array.push(all_wr, wr_20_10_10), array.push(all_mult, 2.0), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_20_10_10)
+    array.push(all_wr, wr_20_10_15), array.push(all_mult, 2.0), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_20_10_15)
+    array.push(all_wr, wr_20_10_20), array.push(all_mult, 2.0), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_20_10_20)
+    
+    array.push(all_wr, wr_20_14_05), array.push(all_mult, 2.0), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_20_14_05)
+    array.push(all_wr, wr_20_14_10), array.push(all_mult, 2.0), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_20_14_10)
+    array.push(all_wr, wr_20_14_15), array.push(all_mult, 2.0), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_20_14_15)
+    array.push(all_wr, wr_20_14_20), array.push(all_mult, 2.0), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_20_14_20)
+    
+    array.push(all_wr, wr_20_20_05), array.push(all_mult, 2.0), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_20_20_05)
+    array.push(all_wr, wr_20_20_10), array.push(all_mult, 2.0), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_20_20_10)
+    array.push(all_wr, wr_20_20_15), array.push(all_mult, 2.0), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_20_20_15)
+    array.push(all_wr, wr_20_20_20), array.push(all_mult, 2.0), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_20_20_20)
+    
+    // Mult 2.5
+    array.push(all_wr, wr_25_07_05), array.push(all_mult, 2.5), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_25_07_05)
+    array.push(all_wr, wr_25_07_10), array.push(all_mult, 2.5), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_25_07_10)
+    array.push(all_wr, wr_25_07_15), array.push(all_mult, 2.5), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_25_07_15)
+    array.push(all_wr, wr_25_07_20), array.push(all_mult, 2.5), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_25_07_20)
+    
+    array.push(all_wr, wr_25_10_05), array.push(all_mult, 2.5), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_25_10_05)
+    array.push(all_wr, wr_25_10_10), array.push(all_mult, 2.5), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_25_10_10)
+    array.push(all_wr, wr_25_10_15), array.push(all_mult, 2.5), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_25_10_15)
+    array.push(all_wr, wr_25_10_20), array.push(all_mult, 2.5), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_25_10_20)
+    
+    array.push(all_wr, wr_25_14_05), array.push(all_mult, 2.5), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_25_14_05)
+    array.push(all_wr, wr_25_14_10), array.push(all_mult, 2.5), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_25_14_10)
+    array.push(all_wr, wr_25_14_15), array.push(all_mult, 2.5), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_25_14_15)
+    array.push(all_wr, wr_25_14_20), array.push(all_mult, 2.5), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_25_14_20)
+    
+    array.push(all_wr, wr_25_20_05), array.push(all_mult, 2.5), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_25_20_05)
+    array.push(all_wr, wr_25_20_10), array.push(all_mult, 2.5), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_25_20_10)
+    array.push(all_wr, wr_25_20_15), array.push(all_mult, 2.5), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_25_20_15)
+    array.push(all_wr, wr_25_20_20), array.push(all_mult, 2.5), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_25_20_20)
+    
+    // Mult 3.0
+    array.push(all_wr, wr_30_07_05), array.push(all_mult, 3.0), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_30_07_05)
+    array.push(all_wr, wr_30_07_10), array.push(all_mult, 3.0), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_30_07_10)
+    array.push(all_wr, wr_30_07_15), array.push(all_mult, 3.0), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_30_07_15)
+    array.push(all_wr, wr_30_07_20), array.push(all_mult, 3.0), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_30_07_20)
+    
+    array.push(all_wr, wr_30_10_05), array.push(all_mult, 3.0), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_30_10_05)
+    array.push(all_wr, wr_30_10_10), array.push(all_mult, 3.0), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_30_10_10)
+    array.push(all_wr, wr_30_10_15), array.push(all_mult, 3.0), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_30_10_15)
+    array.push(all_wr, wr_30_10_20), array.push(all_mult, 3.0), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_30_10_20)
+    
+    array.push(all_wr, wr_30_14_05), array.push(all_mult, 3.0), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_30_14_05)
+    array.push(all_wr, wr_30_14_10), array.push(all_mult, 3.0), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_30_14_10)
+    array.push(all_wr, wr_30_14_15), array.push(all_mult, 3.0), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_30_14_15)
+    array.push(all_wr, wr_30_14_20), array.push(all_mult, 3.0), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_30_14_20)
+    
+    array.push(all_wr, wr_30_20_05), array.push(all_mult, 3.0), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_30_20_05)
+    array.push(all_wr, wr_30_20_10), array.push(all_mult, 3.0), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_30_20_10)
+    array.push(all_wr, wr_30_20_15), array.push(all_mult, 3.0), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_30_20_15)
+    array.push(all_wr, wr_30_20_20), array.push(all_mult, 3.0), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_30_20_20)
+    
+    // Mult 3.5
+    array.push(all_wr, wr_35_07_05), array.push(all_mult, 3.5), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_35_07_05)
+    array.push(all_wr, wr_35_07_10), array.push(all_mult, 3.5), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_35_07_10)
+    array.push(all_wr, wr_35_07_15), array.push(all_mult, 3.5), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_35_07_15)
+    array.push(all_wr, wr_35_07_20), array.push(all_mult, 3.5), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_35_07_20)
+    
+    array.push(all_wr, wr_35_10_05), array.push(all_mult, 3.5), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_35_10_05)
+    array.push(all_wr, wr_35_10_10), array.push(all_mult, 3.5), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_35_10_10)
+    array.push(all_wr, wr_35_10_15), array.push(all_mult, 3.5), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_35_10_15)
+    array.push(all_wr, wr_35_10_20), array.push(all_mult, 3.5), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_35_10_20)
+    
+    array.push(all_wr, wr_35_14_05), array.push(all_mult, 3.5), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_35_14_05)
+    array.push(all_wr, wr_35_14_10), array.push(all_mult, 3.5), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_35_14_10)
+    array.push(all_wr, wr_35_14_15), array.push(all_mult, 3.5), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_35_14_15)
+    array.push(all_wr, wr_35_14_20), array.push(all_mult, 3.5), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_35_14_20)
+    
+    array.push(all_wr, wr_35_20_05), array.push(all_mult, 3.5), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_35_20_05)
+    array.push(all_wr, wr_35_20_10), array.push(all_mult, 3.5), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_35_20_10)
+    array.push(all_wr, wr_35_20_15), array.push(all_mult, 3.5), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_35_20_15)
+    array.push(all_wr, wr_35_20_20), array.push(all_mult, 3.5), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_35_20_20)
+    
+    // Mult 4.0
+    array.push(all_wr, wr_40_07_05), array.push(all_mult, 4.0), array.push(all_per, 7),  array.push(all_swing, 5),  array.push(all_tot, t_40_07_05)
+    array.push(all_wr, wr_40_07_10), array.push(all_mult, 4.0), array.push(all_per, 7),  array.push(all_swing, 10), array.push(all_tot, t_40_07_10)
+    array.push(all_wr, wr_40_07_15), array.push(all_mult, 4.0), array.push(all_per, 7),  array.push(all_swing, 15), array.push(all_tot, t_40_07_15)
+    array.push(all_wr, wr_40_07_20), array.push(all_mult, 4.0), array.push(all_per, 7),  array.push(all_swing, 20), array.push(all_tot, t_40_07_20)
+    
+    array.push(all_wr, wr_40_10_05), array.push(all_mult, 4.0), array.push(all_per, 10), array.push(all_swing, 5),  array.push(all_tot, t_40_10_05)
+    array.push(all_wr, wr_40_10_10), array.push(all_mult, 4.0), array.push(all_per, 10), array.push(all_swing, 10), array.push(all_tot, t_40_10_10)
+    array.push(all_wr, wr_40_10_15), array.push(all_mult, 4.0), array.push(all_per, 10), array.push(all_swing, 15), array.push(all_tot, t_40_10_15)
+    array.push(all_wr, wr_40_10_20), array.push(all_mult, 4.0), array.push(all_per, 10), array.push(all_swing, 20), array.push(all_tot, t_40_10_20)
+    
+    array.push(all_wr, wr_40_14_05), array.push(all_mult, 4.0), array.push(all_per, 14), array.push(all_swing, 5),  array.push(all_tot, t_40_14_05)
+    array.push(all_wr, wr_40_14_10), array.push(all_mult, 4.0), array.push(all_per, 14), array.push(all_swing, 10), array.push(all_tot, t_40_14_10)
+    array.push(all_wr, wr_40_14_15), array.push(all_mult, 4.0), array.push(all_per, 14), array.push(all_swing, 15), array.push(all_tot, t_40_14_15)
+    array.push(all_wr, wr_40_14_20), array.push(all_mult, 4.0), array.push(all_per, 14), array.push(all_swing, 20), array.push(all_tot, t_40_14_20)
+    
+    array.push(all_wr, wr_40_20_05), array.push(all_mult, 4.0), array.push(all_per, 20), array.push(all_swing, 5),  array.push(all_tot, t_40_20_05)
+    array.push(all_wr, wr_40_20_10), array.push(all_mult, 4.0), array.push(all_per, 20), array.push(all_swing, 10), array.push(all_tot, t_40_20_10)
+    array.push(all_wr, wr_40_20_15), array.push(all_mult, 4.0), array.push(all_per, 20), array.push(all_swing, 15), array.push(all_tot, t_40_20_15)
+    array.push(all_wr, wr_40_20_20), array.push(all_mult, 4.0), array.push(all_per, 20), array.push(all_swing, 20), array.push(all_tot, t_40_20_20)
+
+// ─────────────────────────────────────────────
+// RANK AND FIND TOP-3
+// ─────────────────────────────────────────────
+var int[] sorted_idx = array.new_int(0)
+
+if barstate.islast
+    sorted_idx := array.sort_indices(all_wr, order.ascending)
+
+get_rank_idx(int rank) =>
+    int sz = array.size(sorted_idx)
+    sz > 0 ? array.get(sorted_idx, sz - rank) : 0
+
+// ─────────────────────────────────────────────
+// SIGNALS & CHART VISUALS — User's Current Settings
+// ─────────────────────────────────────────────
+bool is_long  = dir_user == -1.0
+bool is_short = dir_user == 1.0
+
+bool buy_signal  = is_long  and not is_long[1]
+bool sell_signal = is_short and not is_short[1]
+
+// Calculate SL/TP for current bar if signal triggered
+var float active_sl = na
+var float active_tp = na
+var int   active_dir = 0  // 1=long, -1=short
+
+if buy_signal
+    active_dir := 1
+    active_sl  := swing_low_user
+    float risk = close - active_sl
+    active_tp  := close + (risk * i_rr)
+
+if sell_signal
+    active_dir := -1
+    active_sl  := swing_high_user
+    float risk = active_sl - close
+    active_tp  := close - (risk * i_rr)
+
+// Check if SL or TP hit (close trade)
+if active_dir != 0
+    bool hit_sl = active_dir == 1 ? (low <= active_sl) : (high >= active_sl)
+    bool hit_tp = active_dir == 1 ? (high >= active_tp) : (low <= active_tp)
+    if hit_sl or hit_tp
+        active_dir := 0
+        active_sl  := na
+        active_tp  := na
+
+// Plot signals
+plotshape(buy_signal,  "BUY",  shape.labelup,   location.belowbar, color.new(color.lime, 10), text="▲ BUY",  textcolor=color.white, size=size.small)
+plotshape(sell_signal, "SELL", shape.labeldown, location.abovebar, color.new(color.red,  10), text="▼ SELL", textcolor=color.white, size=size.small)
+
+// Plot Supertrend line
+plot(_st_user, "Supertrend", color=is_long ? color.new(color.lime, 20) : color.new(color.red, 20), linewidth=2)
+
+// Plot active SL/TP lines
+plot(active_dir != 0 ? active_sl : na, "Stop Loss",   color=color.new(color.red,  30), linewidth=2, style=plot.style_linebr)
+plot(active_dir != 0 ? active_tp : na, "Take Profit", color=color.new(color.lime, 30), linewidth=2, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────
+// DASHBOARD — Top-3 Leaderboard
+// ─────────────────────────────────────────────
+if i_show_dash and barstate.islast
+    if array.size(all_wr) == 96
+        var table dash = table.new(position.bottom_right, 6, 6,
+             bgcolor      = color.new(color.black, 15),
+             border_color = color.new(color.gray, 50),
+             border_width = 1,
+             frame_color  = color.new(color.gray, 20),
+             frame_width  = 2)
+        
+        // Headers
+        hbg = color.new(#1a1a2e, 0)
+        table.cell(dash, 0, 0, "⚙ OPTIMIZER", text_color=color.white,  bgcolor=hbg, text_size=size.small)
+        table.cell(dash, 1, 0, "Mult",         text_color=color.silver, bgcolor=hbg, text_size=size.small)
+        table.cell(dash, 2, 0, "Period",       text_color=color.silver, bgcolor=hbg, text_size=size.small)
+        table.cell(dash, 3, 0, "Swing",        text_color=color.silver, bgcolor=hbg, text_size=size.small)
+        table.cell(dash, 4, 0, "Win Rate",     text_color=color.silver, bgcolor=hbg, text_size=size.small)
+        table.cell(dash, 5, 0, "Trades",       text_color=color.silver, bgcolor=hbg, text_size=size.small)
+        
+        // Current settings
+        cbg = color.new(#2d1b00, 0)
+        table.cell(dash, 0, 1, "▶ Current",                             text_color=color.orange, bgcolor=cbg, text_size=size.small)
+        table.cell(dash, 1, 1, str.tostring(i_mult, "#.#"),             text_color=color.white,  bgcolor=cbg, text_size=size.small)
+        table.cell(dash, 2, 1, str.tostring(i_per),                     text_color=color.white,  bgcolor=cbg, text_size=size.small)
+        table.cell(dash, 3, 1, str.tostring(i_swing_len),               text_color=color.white,  bgcolor=cbg, text_size=size.small)
+        table.cell(dash, 4, 1, str.tostring(wr_user, "#.#") + "%",
+             text_color = wr_user >= 50.0 ? color.lime : color.red,     bgcolor=cbg, text_size=size.small)
+        table.cell(dash, 5, 1, str.tostring(t_user),                    text_color=color.white,  bgcolor=cbg, text_size=size.small)
+        
+        // Top-3 ranked
+        string[] medals = array.from("🥇 #1 Best", "🥈 #2", "🥉 #3")
+        color[]  rowbgs = array.from(
+             color.new(#003322, 0),
+             color.new(#1a1a1a, 0),
+             color.new(#1a1a1a, 0))
+        
+        for rank = 1 to 3
+            int   idx     = get_rank_idx(rank)
+            float r_wr    = array.get(all_wr,    idx)
+            float r_mult  = array.get(all_mult,  idx)
+            int   r_per   = array.get(all_per,   idx)
+            int   r_swing = array.get(all_swing, idx)
+            int   r_tot   = array.get(all_tot,   idx)
+            int   row     = rank + 1
+            
+            bool  is_current = (r_mult == i_mult and r_per == i_per and r_swing == i_swing_len)
+            color rbg        = array.get(rowbgs, rank - 1)
+            color lbl_color  = rank == 1 ? color.yellow : color.silver
+            string lbl       = array.get(medals, rank - 1) + (is_current ? " ✔" : "")
+            
+            table.cell(dash, 0, row, lbl,                              text_color=lbl_color,  bgcolor=rbg, text_size=size.small)
+            table.cell(dash, 1, row, str.tostring(r_mult, "#.#"),      text_color=color.white, bgcolor=rbg, text_size=size.small)
+            table.cell(dash, 2, row, str.tostring(r_per),              text_color=color.white, bgcolor=rbg, text_size=size.small)
+            table.cell(dash, 3, row, str.tostring(r_swing),            text_color=color.white, bgcolor=rbg, text_size=size.small)
+            table.cell(dash, 4, row, str.tostring(r_wr, "#.#") + "%",
+                 text_color = r_wr >= 50.0 ? color.lime : color.red,   bgcolor=rbg, text_size=size.small)
+            table.cell(dash, 5, row, str.tostring(r_tot),              text_color=color.white, bgcolor=rbg, text_size=size.small)
+        
+        // Hint row
+        int   best_idx   = get_rank_idx(1)
+        float best_wr    = array.get(all_wr,    best_idx)
+        float best_mult  = array.get(all_mult,  best_idx)
+        int   best_per   = array.get(all_per,   best_idx)
+        int   best_swing = array.get(all_swing, best_idx)
+        float delta      = best_wr - wr_user
+        
+        bool   is_already_best = (i_mult == best_mult and i_per == best_per and i_swing_len == best_swing)
+        string hint_text  = ""
+        color  hint_color = color.gray
+        
+        if is_already_best
+            hint_text  := "✔ Your settings are already optimal (RR=" + str.tostring(i_rr,"#.#") + ")"
+            hint_color := color.lime
+        else if delta > 5.0
+            hint_text  := "⚠ Switch to " + str.tostring(best_mult,"#.#") + "/" + str.tostring(best_per) + "/" + str.tostring(best_swing) + " → +" + str.tostring(delta,"#.#") + "%"
+            hint_color := color.yellow
+        else
+            hint_text  := "≈ Marginal difference (" + str.tostring(delta, "#.#") + "%) — keep current"
+            hint_color := color.gray
+        
+        table.merge_cells(dash, 0, 5, 5, 5)
+        table.cell(dash, 0, 5, hint_text,
+             text_color  = hint_color,
+             bgcolor     = color.new(color.black, 40),
+             text_size   = size.small,
+             text_halign = text.align_center)
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+alertcondition(buy_signal,  "BUY Signal",  "BUY — {{ticker}} @ {{close}}")
+alertcondition(sell_signal, "SELL Signal", "SELL — {{ticker}} @ {{close}}")
+
+// ─────────────────────────────────────────────
+// USAGE NOTES
+// ─────────────────────────────────────────────
+// 1. Add to chart. Engine scans 96 combos (ATR mult/period/swing lookback).
+// 2. Set your desired RR ratio in inputs. The optimizer tests all 96 combos
+//    with that RR to find which gives the best win rate.
+// 3. Dashboard shows your current settings vs top-3 ranked combos.
+// 4. Trades exit ONLY on SL/TP hit (not on opposite signals).
+// 5. SL = swing high/low over N candles, TP = entry ± (SL distance × RR).
+// 6. To expand grid: add more Supertrend/swing declarations and array.push() lines.
